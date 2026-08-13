@@ -38,6 +38,7 @@ REQUEST_TIMEOUT    = 30      # seconds for request_url HTTP calls
 COMMAND_TIMEOUT    = 60      # seconds before a shell command is killed
 MAX_READ_CHARS     = 40_000  # chars returned to the model per read_file call
 MAX_URL_CHARS      = 20_000  # chars returned to the model per request_url call
+MAX_GREP_CHARS     = 20_000  # chars returned to the model per search/find call
 
 MODEL              = "big-pickle"
 USER_NAME          = "Ibrahim"
@@ -62,6 +63,73 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Absolute or relative path to the file."}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_in_files",
+            "description": (
+                "Search file contents for a regex pattern. Returns matches as 'path:line: content'. "
+                "Use this to find where things are defined, called, or referenced. "
+                "Automatically skips binary files and common junk dirs (node_modules, .git, etc.). "
+                "Supports include/exclude globs (* and ? wildcards)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern":        {"type": "string", "description": "Regex (or plain text) to search for."},
+                    "path":           {"type": "string", "description": "File or directory to search. Defaults to the current directory."},
+                    "include":        {"type": "array", "items": {"type": "string"}, "description": "Optional glob patterns of files to include, e.g. [\"*.py\", \"*.ts\"]."},
+                    "exclude":        {"type": "array", "items": {"type": "string"}, "description": "Optional glob patterns of files to skip, e.g. [\"test_*\"]."},
+                    "case_sensitive": {"type": "boolean", "description": "Match case exactly. Default false."},
+                    "max_results":    {"type": "integer", "description": "Maximum number of matches to return. Default 200."}
+                },
+                "required": ["pattern"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_file",
+            "description": (
+                "Find files or directories by name or glob pattern. "
+                "Supports * and ? wildcards plus ** for recursive globs (e.g. \"**/test_*\"). "
+                "If the pattern has no wildcards, does a case-insensitive substring match on the "
+                "file/dir name. Returns relative paths, one per line."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern":     {"type": "string", "description": "Glob pattern or name substring, e.g. \"*.py\", \"**/test_*\", \"pickel\"."},
+                    "path":        {"type": "string", "description": "Directory to search. Defaults to the current directory."},
+                    "type":        {"type": "string", "enum": ["file", "dir", "any"], "description": "Filter results to files, dirs, or both. Default any."},
+                    "max_results": {"type": "integer", "description": "Maximum number of results. Default 200."}
+                },
+                "required": ["pattern"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_range",
+            "description": (
+                "Read a specific range of lines from a file (1-based, inclusive). "
+                "Use this to inspect parts of large files instead of read_file, which always "
+                "starts from the top. Line numbers are for reference only — never include them "
+                "in edit_file old_str/new_str."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path":       {"type": "string", "description": "Path to the file."},
+                    "start_line": {"type": "integer", "description": "First line to read (1-based). Default 1."},
+                    "end_line":   {"type": "integer", "description": "Last line to read, inclusive. Defaults to end of file."}
                 },
                 "required": ["path"]
             }
@@ -195,6 +263,251 @@ def tool_read_file(path: str) -> str:
     except Exception as e:
         _status(f"✗ error: {e}", end=True)
         return f"ERROR: {e}"
+
+
+# ── Search / find helpers ─────────────────────────────────────────────────────
+
+_DEFAULT_IGNORE_DIRS = {
+    ".git", "node_modules", "__pycache__", "venv", ".venv", ".env",
+    "dist", "build", ".next", "target", ".cache", "egg-info",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache",
+}
+
+
+def _glob_to_regex(pattern: str) -> str:
+    """Convert a glob pattern (with ** support) into a regex string."""
+    import re as _re
+    rx = ""
+    for i, part in enumerate(pattern.split("**")):
+        if i > 0:
+            rx += ".*"                       # ** crosses directory boundaries
+        esc = _re.escape(part)
+        esc = esc.replace(r"\*", "[^/]*")    # *  single segment wildcard
+        esc = esc.replace(r"\?", "[^/]")     # ?  single char wildcard
+        rx += esc
+    return rx + "$"
+
+
+def _glob_match(pattern: str, name: str) -> bool:
+    """Case-insensitive glob match against a path/name string (supports **)."""
+    import re as _re
+    return _re.match(_glob_to_regex(pattern), name, _re.IGNORECASE) is not None
+
+
+def _glob_match_any(path_str: str, globs: list) -> bool:
+    """True if path_str — or any suffix of it (e.g. 'util/app.py' from
+    'src/util/app.py') — matches any of the glob patterns. Suffix matching
+    makes patterns like 'util/*' or 'test_*' work regardless of depth."""
+    if not globs:
+        return True
+    parts    = path_str.split("/")
+    suffixes = ["/".join(parts[i:]) for i in range(len(parts))]
+    for g in globs:
+        for s in suffixes:
+            if _glob_match(g, s):
+                return True
+    return False
+
+
+def _looks_binary(path: Path) -> bool:
+    """Return True if the first 4KB of the file contains a null byte."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+        return b"\x00" in head
+    except OSError:
+        return True  # unreadable → treat as binary so callers skip it
+
+
+def _prune_ignored(dirnames: list) -> list:
+    """Return dirnames minus the default-ignored ones (sorted)."""
+    return sorted(d for d in dirnames if d not in _DEFAULT_IGNORE_DIRS)
+
+
+def _walk_files(root: Path):
+    """Yield every file under root, skipping default-ignored dirs."""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = _prune_ignored(dirnames)
+        for fn in filenames:
+            yield Path(dirpath) / fn
+
+
+def tool_search_in_files(pattern: str, path: str = ".",
+                         include: list = None, exclude: list = None,
+                         case_sensitive: bool = False, max_results: int = 200) -> str:
+    import re as _re
+    root = Path(path or ".").expanduser()
+    if not root.exists():
+        _status(f"✗ not found: {root}", end=True)
+        return f"ERROR: path not found: {path}"
+    if not pattern:
+        return "ERROR: pattern is required."
+
+    try:
+        flags = 0 if case_sensitive else _re.IGNORECASE
+        rx = _re.compile(pattern, flags)
+    except _re.error as e:
+        _status(f"✗ invalid regex: {e}", end=True)
+        return f"ERROR: invalid regex: {e}"
+
+    # accept a single string in include/exclude too (models sometimes send one)
+    if isinstance(include, str):
+        include = [include]
+    if isinstance(exclude, str):
+        exclude = [exclude]
+    include = include or []
+    exclude = exclude or []
+    max_results = int(max_results or 200)
+
+    def wanted(f: Path) -> bool:
+        rel = f.relative_to(root).as_posix() if root.is_dir() else f.name
+        if include and not _glob_match_any(rel, include):
+            return False
+        if exclude and _glob_match_any(rel, exclude):
+            return False
+        return True
+
+    results = []
+    files = [root] if root.is_file() else _walk_files(root)
+    for f in files:
+        if not wanted(f) or _looks_binary(f):
+            continue
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if rx.search(line):
+                results.append((f, lineno, line.strip()[:500]))
+                if len(results) >= max_results:
+                    break
+        if len(results) >= max_results:
+            break
+
+    total = len(results)
+    if total == 0:
+        _status(f"✓ grep 0 matches for /{pattern}/ in {root}", end=True)
+        return f"(no matches for /{pattern}/ in {root})"
+
+    out = "\n".join(f"{f}:{lineno}: {line}" for f, lineno, line in results)
+    if total >= max_results:
+        out += (f"\n(results capped at max_results={max_results} — "
+                f"narrow with include/exclude or raise max_results)")
+    if len(out) > MAX_GREP_CHARS:
+        out = out[:MAX_GREP_CHARS] + "\n… (truncated)"
+
+    plural = "" if total == 1 else "es"
+    _status(f"✓ grep {total} match{plural} for /{pattern}/ in {root}", end=True)
+    console.print(Panel(
+        out[:3000] + ("…" if len(out) > 3000 else ""),
+        title=f"[{C_FILE}]search_in_files[/] · {total} match{plural}",
+        border_style=C_ACCENT
+    ))
+    return out
+
+
+def _match_find(pattern: str, rel: str, name: str, has_wildcard: bool) -> bool:
+    if has_wildcard:
+        return _glob_match_any(rel, [pattern])
+    return pattern.lower() in name.lower()
+
+
+def tool_find_file(pattern: str, path: str = ".", type: str = "any",
+                   max_results: int = 200) -> str:
+    root = Path(path or ".").expanduser()
+    if not root.exists():
+        return f"ERROR: path not found: {path}"
+    if not root.is_dir():
+        return f"ERROR: not a directory: {path}"
+    if not pattern:
+        return "ERROR: pattern is required."
+
+    max_results  = int(max_results or 200)
+    has_wildcard = any(ch in pattern for ch in "*?")
+    results = []
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = _prune_ignored(dirnames)
+        if type in ("dir", "any"):
+            for d in dirnames:
+                p   = Path(dirpath) / d
+                rel = p.relative_to(root).as_posix()
+                if _match_find(pattern, rel, p.name, has_wildcard):
+                    results.append(rel)
+                    if len(results) >= max_results:
+                        break
+        if type in ("file", "any"):
+            for fn in filenames:
+                p   = Path(dirpath) / fn
+                rel = p.relative_to(root).as_posix()
+                if _match_find(pattern, rel, p.name, has_wildcard):
+                    results.append(rel)
+                    if len(results) >= max_results:
+                        break
+        if len(results) >= max_results:
+            break
+
+    if not results:
+        _status(f"✓ find 0 results for {pattern!r} in {root}", end=True)
+        return f"(no files match {pattern!r} in {root})"
+
+    out = "\n".join(results)
+    if len(out) > MAX_GREP_CHARS:
+        out = out[:MAX_GREP_CHARS] + "\n… (truncated)"
+
+    plural = "" if len(results) == 1 else "s"
+    _status(f"✓ find {len(results)} result{plural} for {pattern!r} in {root}", end=True)
+    console.print(f"  [{C_FILE}]find[/] {len(results)} result{plural} for {pattern!r} in {root}")
+    return out
+
+
+def tool_read_range(path: str, start_line: int = 1, end_line: int = None) -> str:
+    p = Path(path).expanduser()
+    if not p.exists():
+        _status(f"✗ not found: {p}", end=True)
+        return f"ERROR: file not found: {path}"
+    if not p.is_file():
+        _status(f"✗ not a file: {p}", end=True)
+        return f"ERROR: not a file: {path}"
+    if _looks_binary(p):
+        _status(f"✗ binary: {p}", end=True)
+        return f"ERROR: file appears to be binary: {path}"
+
+    try:
+        start_line = int(start_line)
+        if end_line is not None:
+            end_line = int(end_line)
+        if start_line < 1:
+            return f"ERROR: start_line must be >= 1 (got {start_line})."
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return f"ERROR: {e}"
+
+    lines = text.splitlines()
+    total = len(lines)
+    if start_line > total:
+        _status(f"✗ start beyond EOF: {p}", end=True)
+        return f"ERROR: file has only {total} lines (requested start_line={start_line})."
+    if end_line is None:
+        end_line = total
+    elif end_line < start_line:
+        return f"ERROR: end_line ({end_line}) must be >= start_line ({start_line})."
+    end_line = min(end_line, total)
+
+    body = "".join(f"{i:>6}: {ln}\n"
+                   for i, ln in enumerate(lines[start_line - 1:end_line], start_line))
+    if len(body) > MAX_READ_CHARS:
+        body = body[:MAX_READ_CHARS] + "\n… (truncated)"
+
+    header = f"lines {start_line}–{end_line} of {p} ({end_line - start_line + 1} lines)"
+    _status(f"✓ read {start_line}–{end_line} of {p}", end=True)
+    console.print(Panel(
+        Syntax(body[:3000] + ("…" if len(body) > 3000 else ""),
+               p.suffix.lstrip(".") or "text", theme="monokai", line_numbers=False),
+        title=f"[{C_FILE}]{p}[/]  [{C_MUTED}](lines {start_line}–{end_line})[/]",
+        border_style=C_ACCENT
+    ))
+    return f"{header}\n{'-' * 50}\n{body}"
 
 
 def tool_write_file(path: str, content: str) -> str:
@@ -385,13 +698,16 @@ def tool_request_url(url: str, method: str = "GET", headers: dict = None, body: 
 
 
 TOOL_MAP = {
-    "read_file":   tool_read_file,
-    "write_file":  tool_write_file,
-    "edit_file":   tool_edit_file,
-    "delete_file": tool_delete_file,
-    "list_dir":    tool_list_dir,
-    "run_command": tool_run_command,
-    "request_url": tool_request_url,
+    "read_file":       tool_read_file,
+    "read_range":      tool_read_range,
+    "search_in_files": tool_search_in_files,
+    "find_file":       tool_find_file,
+    "write_file":      tool_write_file,
+    "edit_file":       tool_edit_file,
+    "delete_file":     tool_delete_file,
+    "list_dir":        tool_list_dir,
+    "run_command":     tool_run_command,
+    "request_url":     tool_request_url,
 }
 
 # ── Big Pickle client ─────────────────────────────────────────────────────────
@@ -418,8 +734,9 @@ class PickleAgent:
                     "You are a coding agent running on the user's machine.\n"
                     f"Current working directory: {cwd}\n"
                     f"OS: {sys.platform}\n"
-                    "You have access to tools: read_file, write_file, edit_file, "
-                    "delete_file, list_dir, run_command, request_url.\n"
+                    "You have access to tools: read_file, read_range, search_in_files, "
+                    "find_file, write_file, edit_file, delete_file, list_dir, "
+                    "run_command, request_url.\n"
                     "Always use tools to interact with the filesystem. "
                     "Never guess file contents — read them first.\n"
                     "For run_command, always provide a clear reason.\n"
@@ -517,6 +834,7 @@ HELP_TEXT = """
 
 [bold]tips:[/]
   • Ask it to read, write, edit, or delete files
+  • search_in_files / find_file / read_range find & inspect code fast
   • It will always ask before running shell commands
   • Works best with clear, specific requests
 """
