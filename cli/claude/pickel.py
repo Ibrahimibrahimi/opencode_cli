@@ -34,7 +34,7 @@ console = Console()
 ASK_BEFORE_COMMAND = False    # ask user to confirm every shell command
                              # (rm/rmdir always prompt regardless of this flag)
 
-ASK_BEFORE_WRITE   = True    # ask user to confirm file writes / edits
+ASK_BEFORE_WRITE   = False    # ask user to confirm file writes / edits
 ASK_BEFORE_DELETE  = True    # ask user to confirm file deletions
 
 REQUEST_TIMEOUT    = 30      # seconds for request_url HTTP calls
