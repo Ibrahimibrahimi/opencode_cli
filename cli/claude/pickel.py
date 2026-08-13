@@ -8,6 +8,7 @@ import httpx
 import uuid
 import json
 import os
+import inspect
 import subprocess
 import sys
 import shutil
@@ -697,6 +698,22 @@ def tool_request_url(url: str, method: str = "GET", headers: dict = None, body: 
         return f"ERROR: {e}"
 
 
+def _call_tool(fn, fn_args: dict):
+    """Call a tool function, ignoring any keyword args it doesn't declare.
+
+    The model sometimes sends extra/legacy parameters (e.g. offset, limit)
+    that a tool doesn't accept — filter them out so we don't crash with
+    'unexpected keyword argument' TypeErrors.
+    """
+    sig = inspect.signature(fn)
+    for p in sig.parameters.values():
+        if p.kind == inspect.Parameter.VAR_KEYWORD:
+            return fn(**fn_args)          # accepts anything (**kwargs)
+    accepted = set(sig.parameters)
+    filtered = {k: v for k, v in fn_args.items() if k in accepted}
+    return fn(**filtered)
+
+
 TOOL_MAP = {
     "read_file":       tool_read_file,
     "read_range":      tool_read_range,
@@ -798,7 +815,11 @@ class PickleAgent:
 
                     fn = TOOL_MAP.get(fn_name)
                     if fn:
-                        result = fn(**fn_args)
+                        try:
+                            result = _call_tool(fn, fn_args)
+                        except Exception as e:
+                            # never let one bad tool call crash the whole agent
+                            result = f"ERROR: {type(e).__name__}: {e}"
                     else:
                         result = f"ERROR: unknown tool {fn_name}"
 
