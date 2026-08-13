@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 pickle — a free coding agent powered by Big Pickle (opencode.ai/zen)
-Usage: python pickle.py
+Usage: python pickle.py            # new session
+       python pickle.py load       # resume a saved session
 """
 
 import httpx
@@ -12,6 +13,7 @@ import inspect
 import subprocess
 import sys
 import shutil
+import datetime
 from pathlib import Path
 from difflib import unified_diff
 
@@ -43,6 +45,10 @@ MAX_GREP_CHARS     = 20_000  # chars returned to the model per search/find call
 
 MODEL              = "big-pickle"
 USER_NAME          = "Ibrahim"
+
+# Sessions are saved as JSON files inside this folder — one file per
+# conversation, named after that session's UUID (session/<uuid>.json).
+SESSION_DIR        = "session"
 
 # ── palette ──────────────────────────────────────────────────────────────────
 C_ACCENT  = "green"
@@ -730,7 +736,7 @@ TOOL_MAP = {
 # ── Big Pickle client ─────────────────────────────────────────────────────────
 
 class PickleAgent:
-    def __init__(self):
+    def __init__(self, session_data: dict = None):
         self.model    = MODEL
         self.base_url = "https://opencode.ai/zen/v1/chat/completions"
         sid           = uuid.uuid4().hex[:20]
@@ -744,24 +750,97 @@ class PickleAgent:
             "User-Agent":         "opencode/1.15.0",
         }
         cwd = os.getcwd()
-        self.messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a coding agent running on the user's machine.\n"
-                    f"Current working directory: {cwd}\n"
-                    f"OS: {sys.platform}\n"
-                    "You have access to tools: read_file, read_range, search_in_files, "
-                    "find_file, write_file, edit_file, delete_file, list_dir, "
-                    "run_command, request_url.\n"
-                    "Always use tools to interact with the filesystem. "
-                    "Never guess file contents — read them first.\n"
-                    "For run_command, always provide a clear reason.\n"
-                    "Use request_url to fetch documentation, APIs, or any URL the user mentions.\n"
-                    f"The user is called {USER_NAME}."
-                )
-            }
-        ]
+        system_message = {
+            "role": "system",
+            "content": (
+                "You are a coding agent running on the user's machine.\n"
+                f"Current working directory: {cwd}\n"
+                f"OS: {sys.platform}\n"
+                "You have access to tools: read_file, read_range, search_in_files, "
+                "find_file, write_file, edit_file, delete_file, list_dir, "
+                "run_command, request_url.\n"
+                "Always use tools to interact with the filesystem. "
+                "Never guess file contents — read them first.\n"
+                "For run_command, always provide a clear reason.\n"
+                "Use request_url to fetch documentation, APIs, or any URL the user mentions.\n"
+                f"The user is called {USER_NAME}."
+            )
+        }
+
+        if session_data is not None:
+            # resume an existing session from its JSON file
+            self.session_id   = session_data.get("session_id") or str(uuid.uuid4())
+            self.session_file = Path(SESSION_DIR) / f"{self.session_id}.json"
+            self.messages     = session_data.get("messages") or [system_message]
+            self.title        = session_data.get("title") or self._title_from_messages()
+        else:
+            # fresh session → new UUID → session/<uuid>.json
+            self.session_id   = str(uuid.uuid4())
+            self.session_file = Path(SESSION_DIR) / f"{self.session_id}.json"
+            self.messages     = [system_message]
+            self.title        = "untitled"
+        self._save()
+
+    def _save(self):
+        """Persist the current conversation to this session's JSON file."""
+        self.session_file.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "session_id": self.session_id,
+            "title":      self.title,
+            "model":      self.model,
+            "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "messages":   self.messages,
+        }
+        self.session_file.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def _append(self, message: dict):
+        """Append a message to the conversation and persist it right away."""
+        self.messages.append(message)
+        if message.get("role") == "user" and self.title == "untitled":
+            self.title = self._title_from_messages()
+        self._save()
+
+    def _title_from_messages(self) -> str:
+        """Derive a short title from the first user message."""
+        for m in self.messages:
+            if m.get("role") == "user":
+                text = " ".join(str(m.get("content", "")).split())
+                return text[:60] or "untitled"
+        return "untitled"
+
+    @staticmethod
+    def list_sessions() -> list:
+        """Return all saved sessions as [{session_id, title, created_at}, ...] (newest first)."""
+        folder = Path(SESSION_DIR)
+        if not folder.exists():
+            return []
+        sessions = []
+        for f in folder.glob("*.json"):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            sessions.append({
+                "session_id": data.get("session_id") or f.stem,
+                "title":      data.get("title") or "untitled",
+                "created_at": data.get("created_at") or "",
+            })
+        sessions.sort(key=lambda s: s["created_at"], reverse=True)
+        return sessions
+
+    @staticmethod
+    def load_session(session_id: str) -> dict:
+        """Load a session JSON by its UUID; returns None if missing/corrupt."""
+        f = Path(SESSION_DIR) / f"{session_id}.json"
+        if not f.exists():
+            return None
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
 
     def _call_api(self) -> dict:
         """Single API call, returns the response dict."""
@@ -782,7 +861,7 @@ class PickleAgent:
 
     def run_turn(self, user_input: str):
         """Run one full agent turn (may involve multiple tool calls)."""
-        self.messages.append({"role": "user", "content": user_input})
+        self._append({"role": "user", "content": user_input})
 
         while True:
             data    = self._call_api()
@@ -790,7 +869,7 @@ class PickleAgent:
             reason  = data["choices"][0].get("finish_reason", "")
 
             # always record the assistant message
-            self.messages.append(message)
+            self._append(message)
 
             # ── plain text reply ──────────────────────────────────────────
             if message.get("content"):
@@ -824,7 +903,7 @@ class PickleAgent:
                         result = f"ERROR: unknown tool {fn_name}"
 
                     # feed result back
-                    self.messages.append({
+                    self._append({
                         "role":         "tool",
                         "tool_call_id": tc_id,
                         "content":      str(result),
@@ -837,8 +916,51 @@ class PickleAgent:
             break
 
     def reset(self):
-        self.messages = [self.messages[0]]  # keep system prompt
-        console.print(f"  [{C_MUTED}]session cleared.[/]")
+        # keep the old session file on disk and start a fresh session
+        self.session_id   = str(uuid.uuid4())
+        self.session_file = Path(SESSION_DIR) / f"{self.session_id}.json"
+        self.messages     = [self.messages[0]]  # keep system prompt
+        self.title        = "untitled"
+        self._save()
+        console.print(f"  [{C_MUTED}]session cleared. new session: {self.session_id}[/]")
+
+
+# ── Session picker (python pickle.py load) ─────────────────────────────────────
+
+def choose_session() -> dict:
+    """Show all saved sessions and let the user strictly pick one to load.
+
+    Returns the chosen session dict (parsed from its JSON file), or None if
+    the user cancels or there are no sessions to choose from.
+    """
+    sessions = PickleAgent.list_sessions()
+    if not sessions:
+        console.print(f"  [{C_WARN}]no saved sessions found in {SESSION_DIR}/[/]")
+        return None
+
+    console.print()
+    console.print(Rule("[bold]saved sessions[/]", style="yellow"))
+    for i, s in enumerate(sessions, 1):
+        console.print(
+            f"  [cyan]{i:>2})[/] [{C_FILE}]{s['session_id']}[/]  "
+            f"{s['title']}  [{C_MUTED}]({s['created_at']})[/]"
+        )
+    console.print()
+
+    while True:
+        choice = Prompt.ask("choose a session (number or uuid, Enter to cancel)").strip()
+        if not choice:
+            return None
+        if choice.isdigit():
+            n = int(choice)
+            if 1 <= n <= len(sessions):
+                return PickleAgent.load_session(sessions[n - 1]["session_id"])
+        else:
+            # accept a full or partial uuid
+            for s in sessions:
+                if s["session_id"].startswith(choice.lower()):
+                    return PickleAgent.load_session(s["session_id"])
+        console.print(f"  [{C_WARN}]invalid choice — pick one of the listed sessions.[/]")
 
 
 # ── CLI loop ──────────────────────────────────────────────────────────────────
@@ -846,8 +968,13 @@ class PickleAgent:
 HELP_TEXT = """
 [bold green]pickle[/] — free coding agent · Big Pickle via opencode.ai/zen
 
+[bold]cli:[/]
+  [cyan]python pickle.py[/]        start a new session
+  [cyan]python pickle.py load[/]   pick a saved session to resume
+
 [bold]commands:[/]
-  [cyan]/reset[/]   clear conversation history
+  [cyan]/reset[/]   clear conversation history (starts a new session)
+  [cyan]/session[/]  show current session id + saved file
   [cyan]/cwd[/]     show current working directory
   [cyan]/cd[/] [dim]<path>[/]  change working directory
   [cyan]/help[/]    show this message
@@ -873,7 +1000,19 @@ def banner():
 
 def main():
     banner()
-    agent = PickleAgent()
+
+    # python pickle.py load → pick a saved session to resume
+    session_data = None
+    if len(sys.argv) > 1 and sys.argv[1] == "load":
+        session_data = choose_session()
+        if session_data is None:
+            console.print(f"  [{C_MUTED}]no session chosen — starting a fresh one.[/]")
+
+    agent = PickleAgent(session_data)
+    if session_data is not None:
+        console.print(f"  [{C_MUTED}]resumed session {agent.session_id}  →  {agent.session_file}[/]")
+    else:
+        console.print(f"  [{C_MUTED}]session {agent.session_id}  →  {agent.session_file}[/]")
 
     while True:
         try:
@@ -898,6 +1037,9 @@ def main():
             continue
         elif user_input == "/cwd":
             console.print(f"[{C_FILE}]{os.getcwd()}[/]")
+            continue
+        elif user_input == "/session":
+            console.print(f"[{C_FILE}]{agent.session_id}[/]  [{C_MUTED}](saved to {agent.session_file})[/]")
             continue
         elif user_input.startswith("/cd"):
             parts = user_input.split(maxsplit=1)
