@@ -28,7 +28,7 @@ console = Console()
 # ── config ────────────────────────────────────────────────────────────────────
 # Set these to customize behaviour without touching the rest of the code.
 
-ASK_BEFORE_COMMAND = True    # ask user to confirm every shell command
+ASK_BEFORE_COMMAND = False    # ask user to confirm every shell command
                              # (rm/rmdir always prompt regardless of this flag)
 
 ASK_BEFORE_WRITE   = True    # ask user to confirm file writes / edits
