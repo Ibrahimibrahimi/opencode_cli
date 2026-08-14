@@ -9,6 +9,7 @@ import httpx
 import uuid
 import json
 import os
+import random
 import inspect
 import subprocess
 import sys
@@ -42,6 +43,7 @@ COMMAND_TIMEOUT    = 60      # seconds before a shell command is killed
 MAX_READ_CHARS     = 40_000  # chars returned to the model per read_file call
 MAX_URL_CHARS      = 20_000  # chars returned to the model per request_url call
 MAX_GREP_CHARS     = 20_000  # chars returned to the model per search/find call
+MAX_COMMAND_CHARS  = 20_000  # chars returned to the model per run_command call
 
 MODEL              = "big-pickle"
 USER_NAME          = "Ibrahim"
@@ -205,7 +207,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "run_command",
-            "description": "Run a shell command on the user's machine. ALWAYS use this for installs, tests, git, builds. The user will be asked to confirm before execution.",
+            "description": "Run a shell command on the user's machine. ALWAYS use this for installs, tests, git, builds. Destructive commands (rm/rmdir) always prompt for confirmation; set ASK_BEFORE_COMMAND=True to confirm every command.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -262,6 +264,9 @@ def tool_read_file(path: str) -> str:
     if not p.is_file():
         _status(f"✗ not a file: {p}", end=True)
         return f"ERROR: not a file: {path}"
+    if _looks_binary(p):
+        _status(f"✗ binary: {p}", end=True)
+        return f"ERROR: file appears to be binary: {path}"
     try:
         content = p.read_text(encoding="utf-8", errors="replace")
         text = content[:MAX_READ_CHARS] + ("\n… (truncated)" if len(content) > MAX_READ_CHARS else "")
@@ -651,6 +656,8 @@ def tool_run_command(command: str, reason: str = "") -> str:
         if result.stderr:
             output += result.stderr
         output = output.strip() or "(no output)"
+        if len(output) > MAX_COMMAND_CHARS:
+            output = output[:MAX_COMMAND_CHARS] + f"\n… (output truncated at {MAX_COMMAND_CHARS} chars)"
         console.print(Panel(
             output[:3000] + ("…" if len(output) > 3000 else ""),
             title=f"[{C_MUTED}]exit code {result.returncode}[/]",
@@ -671,11 +678,19 @@ def tool_request_url(url: str, method: str = "GET", headers: dict = None, body: 
         if headers:
             req_headers.update(headers)
 
-        kwargs = dict(headers=req_headers, timeout=REQUEST_TIMEOUT, follow_redirects=True)
-        if method.upper() == "POST" and body:
-            kwargs["content"] = body.encode()
+        client_kwargs = dict(headers=req_headers, timeout=REQUEST_TIMEOUT, follow_redirects=True)
+        entry = _pick_proxy()
+        if entry:
+            mounts = _build_httpx_mounts(entry)
+            if mounts:
+                client_kwargs["mounts"] = mounts
 
-        resp = httpx.request(method.upper(), url, **kwargs)
+        req_kwargs = {}
+        if method.upper() == "POST" and body:
+            req_kwargs["content"] = body.encode()
+
+        with httpx.Client(**client_kwargs) as client:
+            resp = client.request(method.upper(), url, **req_kwargs)
 
         content_type = resp.headers.get("content-type", "")
 
@@ -733,6 +748,122 @@ TOOL_MAP = {
     "request_url":     tool_request_url,
 }
 
+# ── Proxy support ─────────────────────────────────────────────────────────────
+
+PROXY_LIST = None    # list of {"http": .., "https": ..} dicts, loaded via setup_proxy() or the /proxy command
+USE_PROXY  = False   # master switch — True once the user enables proxying
+
+
+def _normalize_proxy_url(url: str) -> str:
+    """Ensure a proxy URL has a scheme (defaults to http://)."""
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if "://" not in url:
+        url = "http://" + url
+    return url
+
+
+def _validate_proxy_list(data) -> str:
+    """Return an error message if data is not [{"http": ..., "https": ...}, ...], else ''."""
+    if not isinstance(data, list):
+        return ('top level must be a JSON list, e.g. '
+                '[{"http": "1.2.3.4:8080", "https": "5.6.7.8:8080"}, ...]')
+    if not data:
+        return "the list is empty — add at least one proxy entry"
+    for i, entry in enumerate(data, 1):
+        if not isinstance(entry, dict):
+            return f"entry #{i} must be an object (depth-2 dict), got {type(entry).__name__}"
+        if not entry:
+            return f"entry #{i} is empty — expected keys like 'http' and 'https'"
+        for key, val in entry.items():
+            if isinstance(val, (int, float)):
+                continue  # tolerate bare numbers, coerced to str later
+            if not isinstance(val, str):
+                return f"entry #{i} key {key!r} must be a string, got {type(val).__name__}"
+    return ""
+
+
+def _build_httpx_mounts(entry: dict) -> dict:
+    """Turn one proxy entry into an httpx mounts dict (per-scheme proxies).
+
+    httpx >= 0.26 dropped the old `proxies=` dict; per-scheme proxies now go
+    through Client(mounts={"http://": Proxy(...), "https://": Proxy(...)}).
+    Malformed proxy URLs are skipped.
+    """
+    mounts = {}
+    for scheme in ("http", "https"):
+        raw = entry.get(scheme)
+        if raw is None:
+            continue
+        url = _normalize_proxy_url(str(raw))
+        if not url:
+            continue
+        try:
+            mounts[f"{scheme}://"] = httpx.Proxy(url)
+        except Exception:
+            continue  # skip malformed proxy URLs
+    return mounts
+
+
+def _pick_proxy() -> dict:
+    """Return a random proxy entry when proxying is enabled, else None."""
+    if not USE_PROXY or not PROXY_LIST:
+        return None
+    return random.choice(PROXY_LIST)
+
+
+def _load_proxy_file() -> list:
+    """Prompt for a proxy JSON file path and validate it in a loop.
+
+    The file must contain a list of depth-2 dicts, e.g.:
+        [{"http": "111.111.11", "https": "11.222.55.66"}, ...]
+
+    Loops on errors (file not found, bad JSON, wrong structure) until the
+    user provides a valid file or cancels (empty path → returns None).
+    """
+    while True:
+        raw = Prompt.ask(f"  [{C_USER}]path to proxy JSON file[/]").strip().strip('"').strip("'")
+        if not raw:
+            console.print(f"  [{C_WARN}]no path given — proxy disabled.[/]")
+            return None
+
+        path = Path(raw).expanduser()
+        if not path.is_file():
+            console.print(f"  [{C_WARN}]✗ file not found: {path} — try again (Enter to disable).[/]")
+            continue
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            console.print(f"  [{C_WARN}]✗ invalid JSON: {e} — try again.[/]")
+            continue
+        except OSError as e:
+            console.print(f"  [{C_WARN}]✗ cannot read file: {e} — try again.[/]")
+            continue
+
+        error = _validate_proxy_list(data)
+        if error:
+            console.print(f"  [{C_WARN}]✗ invalid proxy file: {error} — try again.[/]")
+            continue
+
+        console.print(
+            f"  [{C_ACCENT}]✓ loaded {len(data)} entr{'y' if len(data) == 1 else 'ies'} from {path}[/]"
+        )
+        return data
+
+
+def setup_proxy() -> list:
+    """Startup question: ask whether to use a proxy, then load the file if yes.
+
+    Returns the list of proxy entries, or None when the user opts out/cancels.
+    """
+    console.print()
+    if not Confirm.ask(f"  [{C_USER}]use a proxy for network requests?[/]", default=False):
+        return None
+    return _load_proxy_file()
+
+
 # ── Big Pickle client ─────────────────────────────────────────────────────────
 
 class PickleAgent:
@@ -771,7 +902,13 @@ class PickleAgent:
             # resume an existing session from its JSON file
             self.session_id   = session_data.get("session_id") or str(uuid.uuid4())
             self.session_file = Path(SESSION_DIR) / f"{self.session_id}.json"
-            self.messages     = session_data.get("messages") or [system_message]
+            messages          = session_data.get("messages") or [system_message]
+            # refresh the system prompt — the saved one may hold a stale cwd
+            if messages and messages[0].get("role") == "system":
+                messages = [system_message] + messages[1:]
+            else:
+                messages = [system_message] + messages
+            self.messages     = messages
             self.title        = session_data.get("title") or self._title_from_messages()
         else:
             # fresh session → new UUID → session/<uuid>.json
@@ -843,30 +980,75 @@ class PickleAgent:
             return None
 
     def _call_api(self) -> dict:
-        """Single API call, returns the response dict."""
-        with console.status(f"[{C_ACCENT}]thinking…[/]", spinner="dots"):
-            resp = httpx.post(
-                self.base_url,
-                headers=self.headers,
-                json={
-                    "model":    self.model,
-                    "messages": self.messages,
-                    "tools":    TOOLS,
-                    "tool_choice": "auto",
-                },
-                timeout=120,
-            )
-        resp.raise_for_status()
-        return resp.json()
+        """Single API call, returns the response dict.
+
+        Retries up to 3 times with backoff on transient failures (429, 5xx,
+        network timeouts) before giving up.
+        """
+        import time
+        last_exc: Exception = None
+        for attempt in range(1, 4):
+            try:
+                with console.status(f"[{C_ACCENT}]thinking…[/]", spinner="dots"):
+                    client_kwargs = {"timeout": 120}
+                    entry = _pick_proxy()
+                    if entry:
+                        mounts = _build_httpx_mounts(entry)
+                        if mounts:
+                            client_kwargs["mounts"] = mounts
+                    with httpx.Client(**client_kwargs) as client:
+                        resp = client.post(
+                            self.base_url,
+                            # fresh request id per call (the session id stays constant)
+                            headers={**self.headers, "x-opencode-request": f"msg_{uuid.uuid4().hex[:20]}"},
+                            json={
+                                "model":        self.model,
+                                "messages":     self.messages,
+                                "tools":        TOOLS,
+                                "tool_choice":  "auto",
+                            },
+                        )
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    last_exc = httpx.HTTPStatusError(
+                        f"HTTP {resp.status_code}",
+                        request=resp.request,
+                        response=resp,
+                    )
+                    console.print(
+                        f"  [{C_WARN}]API error {resp.status_code} — retrying ({attempt}/3)…[/]"
+                    )
+                    time.sleep(2 * attempt)
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            except (httpx.TransportError, httpx.TimeoutException) as e:
+                last_exc = e
+                console.print(
+                    f"  [{C_WARN}]network error: {e} — retrying ({attempt}/3)…[/]"
+                )
+                time.sleep(2 * attempt)
+        if last_exc is not None:
+            raise last_exc
+        raise httpx.TransportError("API call failed after 3 attempts")
+
+    MAX_TOOL_TURNS = 25  # guard against the model looping forever on tool calls
 
     def run_turn(self, user_input: str):
         """Run one full agent turn (may involve multiple tool calls)."""
         self._append({"role": "user", "content": user_input})
 
+        tool_turns = 0
         while True:
-            data    = self._call_api()
-            message = data["choices"][0]["message"]
-            reason  = data["choices"][0].get("finish_reason", "")
+            data = self._call_api()
+            try:
+                choice  = data["choices"][0]
+                message = choice["message"]
+            except (KeyError, IndexError, TypeError) as e:
+                # unexpected API response shape — never crash the CLI over it
+                console.print(f"[{C_WARN}]unexpected API response:[/] {e}")
+                console.print(f"[{C_MUTED}]{str(data)[:500]}[/]")
+                return
+            reason = choice.get("finish_reason", "")
 
             # always record the assistant message
             self._append(message)
@@ -884,10 +1066,39 @@ class PickleAgent:
             # ── tool calls ───────────────────────────────────────────────
             if reason == "tool_calls" or message.get("tool_calls"):
                 tool_calls = message.get("tool_calls", [])
+                if not tool_calls:
+                    # finish_reason says tool_calls but none present —
+                    # stop instead of looping forever
+                    break
+
+                tool_turns += 1
+                if tool_turns > self.MAX_TOOL_TURNS:
+                    console.print(
+                        f"  [{C_WARN}]stopping after {self.MAX_TOOL_TURNS} tool-call rounds "
+                        "— possible loop.[/]"
+                    )
+                    break
+
                 for tc in tool_calls:
-                    fn_name = tc["function"]["name"]
-                    fn_args = json.loads(tc["function"]["arguments"])
-                    tc_id   = tc["id"]
+                    try:
+                        fn_name = tc["function"]["name"]
+                        fn_args = json.loads(tc["function"]["arguments"] or "{}")
+                        tc_id   = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                    except (KeyError, TypeError, json.JSONDecodeError) as e:
+                        # malformed tool call — report it back as a tool result
+                        # instead of crashing the whole CLI
+                        fn_name = "?"
+                        fn_args = {}
+                        tc_id   = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                        result  = f"ERROR: malformed tool call: {type(e).__name__}: {e}"
+                        console.print()
+                        console.print(Rule(f"[{C_TOOL}]tool · {fn_name}[/]", style="yellow"))
+                        self._append({
+                            "role":         "tool",
+                            "tool_call_id": tc_id,
+                            "content":      str(result),
+                        })
+                        continue
 
                     console.print()
                     console.print(Rule(f"[{C_TOOL}]tool · {fn_name}[/]", style="yellow"))
@@ -977,14 +1188,19 @@ HELP_TEXT = """
   [cyan]/session[/]  show current session id + saved file
   [cyan]/cwd[/]     show current working directory
   [cyan]/cd[/] [dim]<path>[/]  change working directory
+  [cyan]/proxy[/]   enable proxy — asks for the proxy JSON file path
+  [cyan]/proxy off[/]  disable the proxy
   [cyan]/help[/]    show this message
   [cyan]/exit[/]    quit
 
 [bold]tips:[/]
   • Ask it to read, write, edit, or delete files
   • search_in_files / find_file / read_range find & inspect code fast
-  • It will always ask before running shell commands
+  • Destructive commands (rm/rmdir) always ask for confirmation
   • Works best with clear, specific requests
+  • Proxy file is a JSON list of dicts like
+    [{"http": "host:port", "https": "host:port"}, ...] — enable it at
+    startup or anytime with /proxy
 """
 
 
@@ -999,7 +1215,13 @@ def banner():
 
 
 def main():
+    global PROXY_LIST, USE_PROXY
     banner()
+
+    # ask about the proxy first — applies to all outbound requests
+    PROXY_LIST = setup_proxy()
+    if PROXY_LIST:
+        USE_PROXY = True
 
     # python pickle.py load → pick a saved session to resume
     session_data = None
@@ -1041,7 +1263,23 @@ def main():
         elif user_input == "/session":
             console.print(f"[{C_FILE}]{agent.session_id}[/]  [{C_MUTED}](saved to {agent.session_file})[/]")
             continue
-        elif user_input.startswith("/cd"):
+        elif user_input == "/proxy off":
+            USE_PROXY = False
+            console.print(f"  [{C_WARN}]proxy OFF.[/]")
+            continue
+        elif user_input == "/proxy":
+            proxies = _load_proxy_file()
+            if proxies is not None:
+                USE_PROXY = True
+                PROXY_LIST = proxies
+                console.print(
+                    f"  [{C_ACCENT}]✓ proxy ON: {len(proxies)} entr{'y' if len(proxies) == 1 else 'ies'}[/]"
+                )
+            else:
+                USE_PROXY = False
+                console.print(f"  [{C_WARN}]proxy OFF — no proxy loaded.[/]")
+            continue
+        elif user_input == "/cd" or user_input.startswith("/cd "):
             parts = user_input.split(maxsplit=1)
             target = parts[1] if len(parts) > 1 else str(Path.home())
             try:
