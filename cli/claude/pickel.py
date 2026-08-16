@@ -9,12 +9,19 @@ import httpx
 import uuid
 import json
 import os
-import random
 import inspect
 import subprocess
 import sys
 import shutil
 import datetime
+import base64
+import hashlib
+import secrets
+import socket
+import string
+import tarfile
+import urllib.parse
+import zipfile
 from pathlib import Path
 from difflib import unified_diff
 
@@ -42,21 +49,24 @@ REQUEST_TIMEOUT    = 30      # seconds for request_url HTTP calls
 COMMAND_TIMEOUT    = 60      # seconds before a shell command is killed
 MAX_READ_CHARS     = 40_000  # chars returned to the model per read_file call
 MAX_URL_CHARS      = 20_000  # chars returned to the model per request_url call
+MAX_WEB_CHARS      = 20_000  # chars returned to the model per websearch call
+
+TODO_FILE          = "TODO.md"   # file the agent writes its todo list to
 MAX_GREP_CHARS     = 20_000  # chars returned to the model per search/find call
 MAX_COMMAND_CHARS  = 20_000  # chars returned to the model per run_command call
 
 MODEL              = "big-pickle"
 USER_NAME          = "Ibrahim"
 
-# Sessions are saved as JSON files inside this folder — one file per
-# conversation, named after that session's UUID (session/<uuid>.json).
-SESSION_DIR        = "session"
+# Absolute path under ~/UserDirs/session (independent of the working directory).
+SESSION_DIR        = str(Path.home() / "UserDirs" / "session")
 
 # ── palette ──────────────────────────────────────────────────────────────────
 C_ACCENT  = "green"
 C_USER    = "bold cyan"
 C_AI      = "bold green"
 C_TOOL    = "bold yellow"
+C_INFO    = "yellow"
 C_WARN    = "bold red"
 C_MUTED   = "dim white"
 C_FILE    = "bold blue"
@@ -236,6 +246,281 @@ TOOLS = [
                     "body":    {"type": "string", "description": "Request body for POST requests (JSON string)."}
                 },
                 "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "websearch",
+            "description": (
+                "Search the web using DuckDuckGo (no API key required). "
+                "Use this to find current information, docs, answers, and resources "
+                "beyond your training data. Returns titles, URLs, and snippets. "
+                "Use request_url afterwards to fetch the full content of a promising link."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query":       {"type": "string", "description": "Search query."},
+                    "max_results": {"type": "integer", "description": "Max results to return (1–10). Default 5."}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "todowrite",
+            "description": (
+                "Write the FULL todo list for the current task to a markdown file "
+                "(default TODO.md in the working directory) and return the current state. "
+                "Call this BEFORE starting implementation, and update it as you make progress. "
+                "Each item is {\"content\": str, \"status\": \"pending\"|\"in_progress\"|\"completed\"} — "
+                "the whole list replaces whatever is in the file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {"type": "array", "description": "Full list of todo items (replaces the current list).",
+                              "items": {"type": "object",
+                                        "properties": {
+                                            "content": {"type": "string", "description": "What needs to be done."},
+                                            "status":  {"type": "string", "enum": ["pending", "in_progress", "completed"]}
+                                        },
+                                        "required": ["content"]}},
+                    "path":   {"type": "string", "description": "File to write todos to. Default TODO.md in cwd."}
+                },
+                "required": ["todos"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "todolist",
+            "description": "Read the current todo list back from the todo file (default TODO.md).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Todo file to read. Default TODO.md in cwd."}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "question",
+            "description": (
+                "Ask the user a question with multiple-choice options and wait for their answer. "
+                "Use this to clarify requirements, preferences, or get decisions mid-task. "
+                "The user can pick an option or type a custom answer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The question to ask."},
+                    "options":  {"type": "array", "items": {"type": "string"}, "description": "Optional choices to offer."},
+                    "header":   {"type": "string", "description": "Optional short context heading shown above the question."}
+                },
+                "required": ["question"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "archive_create",
+            "description": "Create a ZIP or TAR archive from files/directories. Format is auto-detected from the output_path extension (.zip, .tar, .tar.gz/.tgz, .tar.bz2/.tbz2).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_paths": {"type": "array", "items": {"type": "string"}, "description": "Files/directories to include."},
+                    "output_path":  {"type": "string", "description": "Destination archive path, e.g. 'project.zip' or 'backup.tar.gz'."}
+                },
+                "required": ["source_paths", "output_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "archive_extract",
+            "description": "Extract a ZIP or TAR archive into a directory (format auto-detected).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "archive_path": {"type": "string", "description": "Path to the archive file."},
+                    "extract_to":   {"type": "string", "description": "Destination directory."}
+                },
+                "required": ["archive_path", "extract_to"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "hash_text",
+            "description": "Compute the md5/sha256/sha512 hash of a string. Useful for checksums and integrity checks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text":      {"type": "string", "description": "String to hash."},
+                    "algorithm": {"type": "string", "enum": ["md5", "sha256", "sha512"], "description": "Hash algorithm. Default sha256."}
+                },
+                "required": ["text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "hash_file",
+            "description": "Compute the md5/sha256/sha512 hash of a file's contents (streams large files).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Path to the file."},
+                    "algorithm": {"type": "string", "enum": ["md5", "sha256", "sha512"], "description": "Hash algorithm. Default sha256."}
+                },
+                "required": ["file_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "encode_text",
+            "description": "Encode a string: base64, url (percent-encoding), or hex.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "data":     {"type": "string", "description": "Text to encode."},
+                    "encoding": {"type": "string", "enum": ["base64", "url", "hex"], "description": "Encoding scheme. Default base64."}
+                },
+                "required": ["data"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "decode_text",
+            "description": "Decode a base64/url/hex encoded string back to text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "data":     {"type": "string", "description": "Encoded text."},
+                    "encoding": {"type": "string", "enum": ["base64", "url", "hex"], "description": "Encoding scheme. Default base64."}
+                },
+                "required": ["data"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_token",
+            "description": "Generate a cryptographically secure random string (e.g. API keys, secrets).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "length":        {"type": "integer", "description": "Length 1–1000. Default 32."},
+                    "character_set": {"type": "string", "enum": ["alphanumeric", "letters", "digits", "ascii"], "description": "Pool of characters. Default alphanumeric."}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_uuid",
+            "description": "Generate a UUID (version 1 or 4).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "version": {"type": "integer", "enum": [1, 4], "description": "UUID version. Default 4 (random)."}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "directory_tree",
+            "description": "Render a recursive directory tree (like the `tree` command) with a depth limit; skips hidden files and common junk dirs (node_modules, .git, etc.).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path":           {"type": "string", "description": "Root directory. Default '.'."},
+                    "max_depth":      {"type": "integer", "description": "Max depth to descend. Default 4."},
+                    "include_hidden": {"type": "boolean", "description": "Include dotfiles. Default false."},
+                    "skip_ignored":   {"type": "boolean", "description": "Skip node_modules/.git/etc. Default true."}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "file_info",
+            "description": "Get metadata about a file or directory: size, type, modified time, permissions, etc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file or directory."}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "resolve_hostname",
+            "description": "Resolve a hostname to its IPv4/IPv6 addresses (DNS lookup).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hostname": {"type": "string", "description": "Hostname to resolve, e.g. 'example.com'."}
+                },
+                "required": ["hostname"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reverse_dns",
+            "description": "Reverse DNS lookup: map an IP address to its hostname (PTR record).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ip_address": {"type": "string", "description": "IP address, e.g. '8.8.8.8'."}
+                },
+                "required": ["ip_address"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_port",
+            "description": "Check whether a TCP port is open on a host.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "host":    {"type": "string", "description": "Hostname or IP."},
+                    "port":    {"type": "integer", "description": "TCP port 1–65535."},
+                    "timeout": {"type": "integer", "description": "Timeout seconds 1–30. Default 5."}
+                },
+                "required": ["host", "port"]
             }
         }
     }
@@ -678,18 +963,11 @@ def tool_request_url(url: str, method: str = "GET", headers: dict = None, body: 
         if headers:
             req_headers.update(headers)
 
-        client_kwargs = dict(headers=req_headers, timeout=REQUEST_TIMEOUT, follow_redirects=True)
-        entry = _pick_proxy()
-        if entry:
-            mounts = _build_httpx_mounts(entry)
-            if mounts:
-                client_kwargs["mounts"] = mounts
-
         req_kwargs = {}
         if method.upper() == "POST" and body:
             req_kwargs["content"] = body.encode()
 
-        with httpx.Client(**client_kwargs) as client:
+        with httpx.Client(headers=req_headers, timeout=REQUEST_TIMEOUT, follow_redirects=True, trust_env=False) as client:
             resp = client.request(method.upper(), url, **req_kwargs)
 
         content_type = resp.headers.get("content-type", "")
@@ -719,6 +997,573 @@ def tool_request_url(url: str, method: str = "GET", headers: dict = None, body: 
         return f"ERROR: {e}"
 
 
+# ── Web search (DuckDuckGo, no API key) ───────────────────────────────────────
+
+def _ddg_real_url(href: str) -> str:
+    """Decode DuckDuckGo's redirect wrapper (?uddg=...) into the real URL."""
+    import re as _re
+    from urllib.parse import unquote as _unquote
+    if "uddg=" in href:
+        m = _re.search(r"[?&]uddg=([^&]+)", href)
+        if m:
+            return _unquote(m.group(1))
+    return href
+
+
+def tool_websearch(query: str, max_results: int = 5) -> str:
+    """Search the web via DuckDuckGo's HTML endpoint (no API key needed)."""
+    from html.parser import HTMLParser
+
+    max_results = max(1, min(int(max_results or 5), 10))
+    _status(f"searching  {query}")
+
+    class _DuckParser(HTMLParser):
+        """Pull (title, href, snippet) triples out of the DDG results page."""
+
+        def __init__(self):
+            super().__init__()
+            self.results   = []
+            self._cur      = None   # last seen result, so the snippet can attach
+            self._in_title = False
+            self._in_snip  = False
+            self._buf      = []
+
+        def handle_starttag(self, tag, attrs):
+            cls = dict(attrs).get("class", "").split()
+            if tag == "a" and "result__a" in cls:
+                self._cur      = {"href": dict(attrs).get("href", "")}
+                self._in_title = True
+                self._buf      = []
+            elif tag == "a" and "result__snippet" in cls:
+                self._in_snip = True
+                self._buf     = []
+
+        def handle_data(self, data):
+            if self._in_title or self._in_snip:
+                self._buf.append(data)
+
+        def handle_endtag(self, tag):
+            if tag == "a" and self._in_title:
+                title = " ".join("".join(self._buf).split())
+                self._in_title = False
+                if title and self._cur is not None:
+                    self._cur["title"] = title
+                    self.results.append(self._cur)
+            elif tag == "a" and self._in_snip and self._cur is not None:
+                self._cur["snippet"] = " ".join("".join(self._buf).split())
+                self._in_snip = False
+
+    try:
+        with httpx.Client(
+            timeout=REQUEST_TIMEOUT,
+            follow_redirects=True,
+            trust_env=False,
+            headers={
+                "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        ) as client:
+            resp = client.get("https://html.duckduckgo.com/html/", params={"q": query})
+        resp.raise_for_status()
+    except httpx.TimeoutException:
+        _status("✗ timeout", end=True)
+        return f"ERROR: websearch timed out after {REQUEST_TIMEOUT}s"
+    except Exception as e:
+        _status(f"✗ error: {e}", end=True)
+        return f"ERROR: {e}"
+
+    parser = _DuckParser()
+    parser.feed(resp.text)
+    results = parser.results[:max_results]
+
+    if not results:
+        _status(f"✓ no results for {query!r}", end=True)
+        return f"(no web results for {query!r})"
+
+    lines = []
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. {r.get('title', '')}")
+        lines.append(f"   {_ddg_real_url(r.get('href', ''))}")
+        if r.get("snippet"):
+            lines.append(f"   {r['snippet']}")
+        lines.append("")
+    out = "\n".join(lines).strip()
+    if len(out) > MAX_WEB_CHARS:
+        out = out[:MAX_WEB_CHARS] + "\n… (truncated)"
+
+    plural = "" if len(results) == 1 else "s"
+    console.print(Panel(
+        out[:3000] + ("…" if len(out) > 3000 else ""),
+        title=f"[{C_FILE}]websearch[/] · {len(results)} result{plural} for {query!r}",
+        border_style=C_ACCENT
+    ))
+    _status(f"✓ {len(results)} result{plural} for {query!r}", end=True)
+    return out
+
+
+# ── Todo list (persisted to a file) ───────────────────────────────────────────
+
+def _read_todos(path: str) -> list:
+    """Parse a markdown checklist file into [{content, status}, ...]."""
+    import re as _re
+    p = Path(path).expanduser()
+    if not p.exists():
+        return []
+    todos = []
+    marks = {" ": "pending", "-": "in_progress", "~": "in_progress",
+             "x": "completed", "X": "completed"}
+    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = _re.match(r"^\s*[-*]\s*\[([ xX~-])\]\s*(.+?)\s*$", line)
+        if m:
+            todos.append({"content": m.group(2), "status": marks.get(m.group(1), "pending")})
+    return todos
+
+
+def _normalize_todos(todos) -> list:
+    """Normalize raw model input into [{content, status}, ...]."""
+    out = []
+    for t in todos or []:
+        if isinstance(t, str):
+            content, status = t.strip(), "pending"
+        elif isinstance(t, dict):
+            content = str(t.get("content", "")).strip()
+            status  = str(t.get("status", "pending")).lower()
+            if t.get("done") is not None:
+                status = "completed" if t.get("done") else "pending"
+            elif t.get("completed") is not None:
+                status = "completed" if t.get("completed") else "pending"
+            if status not in ("pending", "in_progress", "completed"):
+                status = "pending"
+        else:
+            continue
+        if content:
+            out.append({"content": content, "status": status})
+    return out
+
+
+def _render_todos(todos: list) -> str:
+    if not todos:
+        return "(empty todo list)"
+    marks = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}
+    return "\n".join(
+        f"{i}. {marks[t['status']]} {t['content']}" for i, t in enumerate(todos, 1)
+    )
+
+
+def tool_todowrite(todos: list = None, path: str = TODO_FILE) -> str:
+    """Write the full todo list to a markdown file and return the current state."""
+    p = Path(path).expanduser()
+    items = _normalize_todos(todos) if todos is not None else _read_todos(path)
+
+    lines = ["# TODO", ""]
+    marks = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}
+    for t in items:
+        lines.append(f"- {marks[t['status']]} {t['content']}")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    rendered = _render_todos(items)
+    console.print(Panel(
+        rendered[:3000],
+        title=f"[{C_FILE}]{p}[/]  [{C_MUTED}](todos)[/]",
+        border_style=C_ACCENT
+    ))
+    _status(f"✓ todos saved to {p} ({len(items)} items)", end=True)
+    return f"todos saved to {path}:\n{rendered}"
+
+
+def tool_todolist(path: str = TODO_FILE) -> str:
+    """Read the current todo list back from the file."""
+    p = Path(path).expanduser()
+    items = _read_todos(path)
+    if not items:
+        _status(f"✓ no todos in {p}", end=True)
+        return f"(no todos in {path})"
+    rendered = _render_todos(items)
+    _status(f"✓ read todos from {p}", end=True)
+    return f"todos in {path}:\n{rendered}"
+
+
+# ── Ask the user a question ───────────────────────────────────────────────────
+
+def tool_question(question: str, options: list = None, header: str = "") -> str:
+    """Ask the user a multiple-choice question and return their answer."""
+    console.print()
+    if header:
+        console.print(f"[bold {C_ACCENT}]{header}[/]")
+    console.print(f"[{C_USER}]❓ {question}[/]")
+    options = [str(o) for o in (options or [])]
+    if options:
+        for i, opt in enumerate(options, 1):
+            console.print(f"  [cyan]{i}.[/] {opt}")
+        console.print(f"  [{C_MUTED}]pick a number or type your own answer[/]")
+    try:
+        answer = Prompt.ask("  answer").strip()
+    except (KeyboardInterrupt, EOFError):
+        return "user cancelled the question (no answer)"
+    if options and answer.isdigit():
+        n = int(answer)
+        if 1 <= n <= len(options):
+            answer = options[n - 1]
+    return f"user answered: {answer}"
+
+
+# ── Archive tools (zip / tar / gzip — stdlib only) ────────────────────────────
+
+def _detect_archive_format(path: str) -> str:
+    """Return 'zip' / 'tar' / 'tar.gz' / 'tar.bz2' from a filename, or ''."""
+    p = str(path).lower()
+    for ext, fmt in ((".tar.gz", "tar.gz"), (".tgz", "tar.gz"),
+                     (".tar.bz2", "tar.bz2"), (".tbz2", "tar.bz2"),
+                     (".zip", "zip"), (".tar", "tar")):
+        if p.endswith(ext):
+            return fmt
+    return ""
+
+
+def tool_archive_create(source_paths: list, output_path: str) -> str:
+    """Create a ZIP or TAR archive (format auto-detected from the extension)."""
+    if not source_paths or not isinstance(source_paths, list):
+        return "ERROR: source_paths must be a non-empty list of paths"
+    fmt = _detect_archive_format(output_path)
+    if not fmt:
+        return ("ERROR: unsupported archive extension on output_path — "
+                "use .zip, .tar, .tar.gz, .tgz, .tar.bz2 or .tbz2")
+    out = Path(output_path).expanduser()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.exists() and ASK_BEFORE_WRITE and not Confirm.ask(
+            f"  [{C_WARN}]Overwrite existing archive {out}?[/]", default=False):
+        return "CANCELLED by user."
+    try:
+        added = []
+        if fmt == "zip":
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+                for src in source_paths:
+                    s = Path(src).expanduser()
+                    if s.is_file():
+                        zf.write(s, s.name)
+                        added.append(str(s))
+                    elif s.is_dir():
+                        base = s.parent
+                        for f in sorted(s.rglob("*")):
+                            if f.is_file():
+                                zf.write(f, f.relative_to(base).as_posix())
+                                added.append(str(f))
+        else:
+            mode = {"tar": "w", "tar.gz": "w:gz", "tar.bz2": "w:bz2"}[fmt]
+            with tarfile.open(out, mode) as tf:
+                for src in source_paths:
+                    s = Path(src).expanduser()
+                    if s.exists():
+                        tf.add(s, arcname=s.name)
+                        added.append(str(s))
+        size = out.stat().st_size
+        msg = f"created {fmt} archive {out} with {len(added)} file(s) ({size} bytes)"
+        _status(f"✓ {msg}", end=True)
+        return msg
+    except Exception as e:
+        _status(f"✗ error: {e}", end=True)
+        return f"ERROR: {e}"
+
+
+def tool_archive_extract(archive_path: str, extract_to: str) -> str:
+    """Extract a ZIP or TAR archive (format auto-detected, path-traversal safe)."""
+    p = Path(archive_path).expanduser()
+    if not p.exists():
+        return f"ERROR: archive not found: {archive_path}"
+    fmt = _detect_archive_format(str(p))
+    if not fmt:
+        return f"ERROR: unsupported archive type: {archive_path}"
+    out = Path(extract_to).expanduser()
+    out.mkdir(parents=True, exist_ok=True)
+    try:
+        if fmt == "zip":
+            with zipfile.ZipFile(p, "r") as zf:
+                base = str(out.resolve())
+                for member in zf.namelist():
+                    if not str((out / member).resolve()).startswith(base):
+                        raise ValueError(f"unsafe path in archive: {member}")
+                zf.extractall(out)
+                n = len(zf.namelist())
+        else:
+            with tarfile.open(p, "r:*") as tf:
+                tf.extractall(out)
+                n = len(tf.getnames())
+        msg = f"extracted {n} entr{'y' if n == 1 else 'ies'} from {p} to {out}"
+        _status(f"✓ {msg}", end=True)
+        return msg
+    except Exception as e:
+        _status(f"✗ error: {e}", end=True)
+        return f"ERROR: {e}"
+
+
+# ── Crypto tools (hashing / encoding / generation) ────────────────────────────
+
+_ALGORITHMS = ("md5", "sha256", "sha512")
+
+
+def tool_hash_text(text: str, algorithm: str = "sha256") -> str:
+    """Compute md5/sha256/sha512 hash of a string."""
+    alg = (algorithm or "sha256").lower()
+    if alg not in _ALGORITHMS:
+        return "ERROR: algorithm must be one of: md5, sha256, sha512"
+    h = hashlib.new(alg, text.encode("utf-8")).hexdigest()
+    console.print(Panel(
+        f"[{C_MUTED}]{len(text)} chars → {alg}[/]\n[h]{h}[/]",
+        title=f"[{C_FILE}]hash_text[/]",
+        border_style=C_ACCENT
+    ))
+    return f"{alg} of {len(text)} chars:\n{h}"
+
+
+def tool_hash_file(file_path: str, algorithm: str = "sha256") -> str:
+    """Compute md5/sha256/sha512 hash of a file's contents (streams large files)."""
+    p = Path(file_path).expanduser()
+    if not p.is_file():
+        return f"ERROR: file not found: {file_path}"
+    alg = (algorithm or "sha256").lower()
+    if alg not in _ALGORITHMS:
+        return "ERROR: algorithm must be one of: md5, sha256, sha512"
+    h = hashlib.new(alg)
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    size = p.stat().st_size
+    msg = f"{alg} of {p} ({size} bytes):\n{h.hexdigest()}"
+    _status(f"✓ hashed {p} ({size} bytes)", end=True)
+    return msg
+
+
+def tool_encode_text(data: str, encoding: str = "base64") -> str:
+    """Encode a string: base64, url (percent-encoding), or hex."""
+    enc = (encoding or "base64").lower()
+    try:
+        if enc == "base64":
+            out = base64.b64encode(data.encode("utf-8")).decode("ascii")
+        elif enc in ("url", "percent"):
+            out = urllib.parse.quote(data, safe="")
+        elif enc == "hex":
+            out = data.encode("utf-8").hex()
+        else:
+            return "ERROR: encoding must be one of: base64, url, hex"
+    except Exception as e:
+        return f"ERROR: {e}"
+    return f"{enc}-encoded ({len(data)} chars → {len(out)} chars):\n{out}"
+
+
+def tool_decode_text(data: str, encoding: str = "base64") -> str:
+    """Decode a base64/url/hex encoded string back to text."""
+    enc = (encoding or "base64").lower()
+    try:
+        if enc == "base64":
+            out = base64.b64decode(data.encode("ascii")).decode("utf-8", errors="replace")
+        elif enc in ("url", "percent"):
+            out = urllib.parse.unquote(data)
+        elif enc == "hex":
+            out = bytes.fromhex(data.strip()).decode("utf-8", errors="replace")
+        else:
+            return "ERROR: encoding must be one of: base64, url, hex"
+    except Exception as e:
+        return f"ERROR: failed to {enc}-decode: {e}"
+    return f"{enc}-decoded ({len(data)} chars → {len(out)} chars):\n{out}"
+
+
+def tool_generate_token(length: int = 32, character_set: str = "alphanumeric") -> str:
+    """Generate a cryptographically secure random string."""
+    try:
+        length = int(length)
+    except (TypeError, ValueError):
+        return "ERROR: length must be an integer"
+    if length < 1 or length > 1000:
+        return "ERROR: length must be between 1 and 1000"
+    cs = (character_set or "alphanumeric").lower()
+    pools = {
+        "alphanumeric": string.ascii_letters + string.digits,
+        "letters":      string.ascii_letters,
+        "digits":       string.digits,
+        "ascii":        string.ascii_letters + string.digits + string.punctuation,
+    }
+    if cs not in pools:
+        return "ERROR: character_set must be one of: alphanumeric, letters, digits, ascii"
+    tok = "".join(secrets.choice(pools[cs]) for _ in range(length))
+    return f"random {cs} token ({length} chars):\n{tok}"
+
+
+def tool_generate_uuid(version: int = 4) -> str:
+    """Generate a UUID (version 1 or 4)."""
+    try:
+        version = int(version)
+    except (TypeError, ValueError):
+        return "ERROR: version must be 1 or 4"
+    if version == 1:
+        u = uuid.uuid1()
+    elif version == 4:
+        u = uuid.uuid4()
+    else:
+        return "ERROR: version must be 1 or 4"
+    return f"uuid{version}: {u}"
+
+
+# ── Network tools (DNS / ports — stdlib socket) ───────────────────────────────
+
+def tool_resolve_hostname(hostname: str) -> str:
+    """Resolve a hostname to its IPv4/IPv6 addresses."""
+    hostname = hostname.strip()
+    if not hostname:
+        return "ERROR: hostname is required"
+    try:
+        ipv4, ipv6 = [], []
+        for info in socket.getaddrinfo(hostname, None):
+            family, _, _, _, sockaddr = info
+            ip = sockaddr[0]
+            if family == socket.AF_INET and ip not in ipv4:
+                ipv4.append(ip)
+            elif family == socket.AF_INET6 and ip not in ipv6:
+                ipv6.append(ip)
+    except socket.gaierror as e:
+        return f"ERROR: failed to resolve {hostname!r}: {e}"
+    except Exception as e:
+        return f"ERROR: {e}"
+    out = (f"{hostname}:\n"
+           f"  ipv4: {', '.join(ipv4) or '(none)'}\n"
+           f"  ipv6: {', '.join(ipv6) or '(none)'}")
+    _status(f"✓ resolved {hostname}", end=True)
+    return out
+
+
+def tool_reverse_dns(ip_address: str) -> str:
+    """Reverse DNS lookup: IP → hostname (PTR record)."""
+    ip = ip_address.strip()
+    if not ip:
+        return "ERROR: ip_address is required"
+    try:
+        hostname, _, _ = socket.gethostbyaddr(ip)
+        _status(f"✓ PTR for {ip}", end=True)
+        return f"PTR for {ip}:\n{hostname}"
+    except socket.herror:
+        return f"no reverse DNS record for {ip}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+def tool_check_port(host: str, port: int, timeout: int = 5) -> str:
+    """Check whether a TCP port is open on a host."""
+    try:
+        port = int(port)
+        timeout = int(timeout)
+    except (TypeError, ValueError):
+        return "ERROR: port and timeout must be integers"
+    if port < 1 or port > 65535:
+        return "ERROR: port must be between 1 and 65535"
+    timeout = max(1, min(timeout, 30))
+    host = host.strip()
+    if not host:
+        return "ERROR: host is required"
+    import time as _time
+    start = _time.time()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            result = s.connect_ex((host, port))
+        ms = round((_time.time() - start) * 1000, 2)
+    except socket.timeout:
+        return f"port {port} on {host}: timeout after {timeout}s"
+    except Exception as e:
+        return f"ERROR: {e}"
+    state = "open" if result == 0 else "closed/filtered"
+    _status(f"✓ port check {host}:{port} ({state})", end=True)
+    return f"port {port} on {host}: {state} ({ms} ms)"
+
+
+# ── File system extras (tree + info) ──────────────────────────────────────────
+
+def _human_size(n: int) -> str:
+    """Format a byte count as B/KB/MB/GB/TB."""
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{int(n)} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n} B"
+
+
+def tool_directory_tree(path: str = ".", max_depth: int = 4,
+                        include_hidden: bool = False, skip_ignored: bool = True) -> str:
+    """Render a recursive directory tree (like the `tree` command), depth-limited."""
+    root = Path(path or ".").expanduser()
+    if not root.is_dir():
+        return f"ERROR: directory not found: {path}"
+    if max_depth is None:
+        max_depth = 99
+    try:
+        max_depth = int(max_depth)
+    except (TypeError, ValueError):
+        return "ERROR: max_depth must be an integer"
+    max_depth = max(0, max_depth)
+
+    lines = [root.name + "/"]
+
+    def _walk(current: Path, prefix: str, depth: int):
+        if depth >= max_depth:
+            return
+        try:
+            entries = sorted(current.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        except OSError as e:
+            lines.append(f"{prefix}[error: {e}]")
+            return
+        visible = []
+        for e in entries:
+            if not include_hidden and e.name.startswith("."):
+                continue
+            if skip_ignored and e.is_dir() and e.name in _DEFAULT_IGNORE_DIRS:
+                continue
+            visible.append(e)
+        for i, e in enumerate(visible):
+            last = i == len(visible) - 1
+            branch = "└── " if last else "├── "
+            lines.append(f"{prefix}{branch}{e.name}{'/' if e.is_dir() else ''}")
+            if e.is_dir():
+                _walk(e, prefix + ("    " if last else "│   "), depth + 1)
+
+    _walk(root, "", 0)
+    out = "\n".join(lines)
+    if len(out) > MAX_GREP_CHARS:
+        out = out[:MAX_GREP_CHARS] + "\n… (truncated)"
+    console.print(Panel(
+        out[:3000] + ("…" if len(out) > 3000 else ""),
+        title=f"[{C_FILE}]directory_tree[/] · {root}",
+        border_style=C_ACCENT
+    ))
+    _status(f"✓ tree of {root} ({len(lines)} lines)", end=True)
+    return out
+
+
+def tool_file_info(path: str) -> str:
+    """Get metadata about a file or directory."""
+    p = Path(path).expanduser()
+    if not p.exists():
+        return f"ERROR: path not found: {path}"
+    try:
+        st = p.stat()
+    except OSError as e:
+        return f"ERROR: {e}"
+    kind = "directory" if p.is_dir() else ("file" if p.is_file() else "other")
+    lines = [
+        f"name:        {p.name or str(p)}",
+        f"type:        {kind}" + (" (symlink)" if p.is_symlink() else ""),
+        f"size:        {_human_size(st.st_size)} ({st.st_size} bytes)",
+        f"modified:    {datetime.datetime.fromtimestamp(st.st_mtime).isoformat(timespec='seconds')}",
+        f"absolute:    {p.resolve()}",
+        f"parent:      {p.parent}",
+        f"permissions: {oct(st.st_mode & 0o777)}",
+    ]
+    if p.is_file():
+        lines.insert(3, f"suffix:      {p.suffix or '(none)'}")
+    _status(f"✓ info {p}", end=True)
+    return "\n".join(lines)
+
+
 def _call_tool(fn, fn_args: dict):
     """Call a tool function, ignoring any keyword args it doesn't declare.
 
@@ -746,123 +1591,24 @@ TOOL_MAP = {
     "list_dir":        tool_list_dir,
     "run_command":     tool_run_command,
     "request_url":     tool_request_url,
+    "websearch":       tool_websearch,
+    "todowrite":       tool_todowrite,
+    "todolist":        tool_todolist,
+    "question":        tool_question,
+    "archive_create":  tool_archive_create,
+    "archive_extract": tool_archive_extract,
+    "hash_text":       tool_hash_text,
+    "hash_file":       tool_hash_file,
+    "encode_text":     tool_encode_text,
+    "decode_text":     tool_decode_text,
+    "generate_token":  tool_generate_token,
+    "generate_uuid":   tool_generate_uuid,
+    "directory_tree":  tool_directory_tree,
+    "file_info":       tool_file_info,
+    "resolve_hostname": tool_resolve_hostname,
+    "reverse_dns":     tool_reverse_dns,
+    "check_port":      tool_check_port,
 }
-
-# ── Proxy support ─────────────────────────────────────────────────────────────
-
-PROXY_LIST = None    # list of {"http": .., "https": ..} dicts, loaded via setup_proxy() or the /proxy command
-USE_PROXY  = False   # master switch — True once the user enables proxying
-
-
-def _normalize_proxy_url(url: str) -> str:
-    """Ensure a proxy URL has a scheme (defaults to http://)."""
-    url = (url or "").strip()
-    if not url:
-        return ""
-    if "://" not in url:
-        url = "http://" + url
-    return url
-
-
-def _validate_proxy_list(data) -> str:
-    """Return an error message if data is not [{"http": ..., "https": ...}, ...], else ''."""
-    if not isinstance(data, list):
-        return ('top level must be a JSON list, e.g. '
-                '[{"http": "1.2.3.4:8080", "https": "5.6.7.8:8080"}, ...]')
-    if not data:
-        return "the list is empty — add at least one proxy entry"
-    for i, entry in enumerate(data, 1):
-        if not isinstance(entry, dict):
-            return f"entry #{i} must be an object (depth-2 dict), got {type(entry).__name__}"
-        if not entry:
-            return f"entry #{i} is empty — expected keys like 'http' and 'https'"
-        for key, val in entry.items():
-            if isinstance(val, (int, float)):
-                continue  # tolerate bare numbers, coerced to str later
-            if not isinstance(val, str):
-                return f"entry #{i} key {key!r} must be a string, got {type(val).__name__}"
-    return ""
-
-
-def _build_httpx_mounts(entry: dict) -> dict:
-    """Turn one proxy entry into an httpx mounts dict (per-scheme proxies).
-
-    httpx >= 0.26 dropped the old `proxies=` dict; per-scheme proxies now go
-    through Client(mounts={"http://": Proxy(...), "https://": Proxy(...)}).
-    Malformed proxy URLs are skipped.
-    """
-    mounts = {}
-    for scheme in ("http", "https"):
-        raw = entry.get(scheme)
-        if raw is None:
-            continue
-        url = _normalize_proxy_url(str(raw))
-        if not url:
-            continue
-        try:
-            mounts[f"{scheme}://"] = httpx.Proxy(url)
-        except Exception:
-            continue  # skip malformed proxy URLs
-    return mounts
-
-
-def _pick_proxy() -> dict:
-    """Return a random proxy entry when proxying is enabled, else None."""
-    if not USE_PROXY or not PROXY_LIST:
-        return None
-    return random.choice(PROXY_LIST)
-
-
-def _load_proxy_file() -> list:
-    """Prompt for a proxy JSON file path and validate it in a loop.
-
-    The file must contain a list of depth-2 dicts, e.g.:
-        [{"http": "111.111.11", "https": "11.222.55.66"}, ...]
-
-    Loops on errors (file not found, bad JSON, wrong structure) until the
-    user provides a valid file or cancels (empty path → returns None).
-    """
-    while True:
-        raw = Prompt.ask(f"  [{C_USER}]path to proxy JSON file[/]").strip().strip('"').strip("'")
-        if not raw:
-            console.print(f"  [{C_WARN}]no path given — proxy disabled.[/]")
-            return None
-
-        path = Path(raw).expanduser()
-        if not path.is_file():
-            console.print(f"  [{C_WARN}]✗ file not found: {path} — try again (Enter to disable).[/]")
-            continue
-
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as e:
-            console.print(f"  [{C_WARN}]✗ invalid JSON: {e} — try again.[/]")
-            continue
-        except OSError as e:
-            console.print(f"  [{C_WARN}]✗ cannot read file: {e} — try again.[/]")
-            continue
-
-        error = _validate_proxy_list(data)
-        if error:
-            console.print(f"  [{C_WARN}]✗ invalid proxy file: {error} — try again.[/]")
-            continue
-
-        console.print(
-            f"  [{C_ACCENT}]✓ loaded {len(data)} entr{'y' if len(data) == 1 else 'ies'} from {path}[/]"
-        )
-        return data
-
-
-def setup_proxy() -> list:
-    """Startup question: ask whether to use a proxy, then load the file if yes.
-
-    Returns the list of proxy entries, or None when the user opts out/cancels.
-    """
-    console.print()
-    if not Confirm.ask(f"  [{C_USER}]use a proxy for network requests?[/]", default=False):
-        return None
-    return _load_proxy_file()
-
 
 # ── Big Pickle client ─────────────────────────────────────────────────────────
 
@@ -889,7 +1635,10 @@ class PickleAgent:
                 f"OS: {sys.platform}\n"
                 "You have access to tools: read_file, read_range, search_in_files, "
                 "find_file, write_file, edit_file, delete_file, list_dir, "
-                "run_command, request_url.\n"
+                "run_command, request_url, websearch, todowrite, todolist, question, "
+                "archive_create, archive_extract, hash_text, hash_file, encode_text, "
+                "decode_text, generate_token, generate_uuid, directory_tree, file_info, "
+                "resolve_hostname, reverse_dns, check_port.\n"
                 "Always use tools to interact with the filesystem. "
                 "Never guess file contents — read them first.\n"
                 "For run_command, always provide a clear reason.\n"
@@ -982,21 +1731,17 @@ class PickleAgent:
     def _call_api(self) -> dict:
         """Single API call, returns the response dict.
 
-        Retries up to 3 times with backoff on transient failures (429, 5xx,
-        network timeouts) before giving up.
+        Retries on transient failures (429, 5xx, network timeouts) with a
+        short backoff.
         """
         import time
         last_exc: Exception = None
-        for attempt in range(1, 4):
+        attempts = 0
+        while True:
+            attempts += 1
             try:
                 with console.status(f"[{C_ACCENT}]thinking…[/]", spinner="dots"):
-                    client_kwargs = {"timeout": 120}
-                    entry = _pick_proxy()
-                    if entry:
-                        mounts = _build_httpx_mounts(entry)
-                        if mounts:
-                            client_kwargs["mounts"] = mounts
-                    with httpx.Client(**client_kwargs) as client:
+                    with httpx.Client(timeout=120, trust_env=False) as client:
                         resp = client.post(
                             self.base_url,
                             # fresh request id per call (the session id stays constant)
@@ -1008,36 +1753,42 @@ class PickleAgent:
                                 "tool_choice":  "auto",
                             },
                         )
-                if resp.status_code == 429 or resp.status_code >= 500:
-                    last_exc = httpx.HTTPStatusError(
-                        f"HTTP {resp.status_code}",
-                        request=resp.request,
-                        response=resp,
-                    )
-                    console.print(
-                        f"  [{C_WARN}]API error {resp.status_code} — retrying ({attempt}/3)…[/]"
-                    )
-                    time.sleep(2 * attempt)
-                    continue
-                resp.raise_for_status()
-                return resp.json()
             except (httpx.TransportError, httpx.TimeoutException) as e:
                 last_exc = e
+                if attempts >= 3:
+                    break
                 console.print(
-                    f"  [{C_WARN}]network error: {e} — retrying ({attempt}/3)…[/]"
+                    f"  [{C_WARN}]network error: {e} — retrying ({attempts}/3)…[/]"
                 )
-                time.sleep(2 * attempt)
+                time.sleep(2 * attempts)
+                continue
+
+            # ── transient API errors → backoff retry ────────────────────
+            if resp.status_code == 429 or resp.status_code >= 500:
+                last_exc = httpx.HTTPStatusError(
+                    f"HTTP {resp.status_code}",
+                    request=resp.request,
+                    response=resp,
+                )
+                if attempts >= 3:
+                    break
+                console.print(
+                    f"  [{C_WARN}]API error {resp.status_code} — retrying ({attempts}/3)…[/]"
+                )
+                time.sleep(2 * attempts)
+                continue
+
+            resp.raise_for_status()
+            return resp.json()
+
         if last_exc is not None:
             raise last_exc
         raise httpx.TransportError("API call failed after 3 attempts")
-
-    MAX_TOOL_TURNS = 25  # guard against the model looping forever on tool calls
 
     def run_turn(self, user_input: str):
         """Run one full agent turn (may involve multiple tool calls)."""
         self._append({"role": "user", "content": user_input})
 
-        tool_turns = 0
         while True:
             data = self._call_api()
             try:
@@ -1069,14 +1820,6 @@ class PickleAgent:
                 if not tool_calls:
                     # finish_reason says tool_calls but none present —
                     # stop instead of looping forever
-                    break
-
-                tool_turns += 1
-                if tool_turns > self.MAX_TOOL_TURNS:
-                    console.print(
-                        f"  [{C_WARN}]stopping after {self.MAX_TOOL_TURNS} tool-call rounds "
-                        "— possible loop.[/]"
-                    )
                     break
 
                 for tc in tool_calls:
@@ -1188,19 +1931,16 @@ HELP_TEXT = """
   [cyan]/session[/]  show current session id + saved file
   [cyan]/cwd[/]     show current working directory
   [cyan]/cd[/] [dim]<path>[/]  change working directory
-  [cyan]/proxy[/]   enable proxy — asks for the proxy JSON file path
-  [cyan]/proxy off[/]  disable the proxy
   [cyan]/help[/]    show this message
   [cyan]/exit[/]    quit
 
 [bold]tips:[/]
   • Ask it to read, write, edit, or delete files
   • search_in_files / find_file / read_range find & inspect code fast
+  • websearch finds things online · todowrite keeps a TODO.md · question asks you
+  • archive_create / hash / encode / network / directory_tree utilities included
   • Destructive commands (rm/rmdir) always ask for confirmation
   • Works best with clear, specific requests
-  • Proxy file is a JSON list of dicts like
-    [{"http": "host:port", "https": "host:port"}, ...] — enable it at
-    startup or anytime with /proxy
 """
 
 
@@ -1215,13 +1955,7 @@ def banner():
 
 
 def main():
-    global PROXY_LIST, USE_PROXY
     banner()
-
-    # ask about the proxy first — applies to all outbound requests
-    PROXY_LIST = setup_proxy()
-    if PROXY_LIST:
-        USE_PROXY = True
 
     # python pickle.py load → pick a saved session to resume
     session_data = None
@@ -1262,22 +1996,6 @@ def main():
             continue
         elif user_input == "/session":
             console.print(f"[{C_FILE}]{agent.session_id}[/]  [{C_MUTED}](saved to {agent.session_file})[/]")
-            continue
-        elif user_input == "/proxy off":
-            USE_PROXY = False
-            console.print(f"  [{C_WARN}]proxy OFF.[/]")
-            continue
-        elif user_input == "/proxy":
-            proxies = _load_proxy_file()
-            if proxies is not None:
-                USE_PROXY = True
-                PROXY_LIST = proxies
-                console.print(
-                    f"  [{C_ACCENT}]✓ proxy ON: {len(proxies)} entr{'y' if len(proxies) == 1 else 'ies'}[/]"
-                )
-            else:
-                USE_PROXY = False
-                console.print(f"  [{C_WARN}]proxy OFF — no proxy loaded.[/]")
             continue
         elif user_input == "/cd" or user_input.startswith("/cd "):
             parts = user_input.split(maxsplit=1)

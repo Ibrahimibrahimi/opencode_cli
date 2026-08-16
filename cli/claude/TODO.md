@@ -11,7 +11,7 @@
 
 ## 2. Dependencies & setup
 - [x] Add `requirements.txt` (`httpx`, `rich`) — nothing declares the deps today
-- [ ] `update.sh`: optionally install the dependencies, not just copy the script
+- [x] `update.sh`: print the dependency install command (and preserve the `SESSION_DIR` customization that a plain `cp` used to clobber)
 
 ## 3. Crash safety (agent loop, `run_turn`)
 - [x] Guard `json.loads(tc["function"]["arguments"])` — malformed JSON currently crashes the whole CLI
